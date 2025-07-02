@@ -1,6 +1,10 @@
-# Enhanced Production-Ready Go Web Server
+# Go Web Server
 
 A robust, feature-rich HTTP/HTTPS web server built with Go, designed for production use with advanced middleware, security features, and comprehensive monitoring capabilities.
+
+![Go](https://img.shields.io/badge/Go-1.19%2B-00ADD8.svg?logo=go)](https://golang.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![HTTP](https://img.shields.io/badge/HTTP-Server-blue.svg)](https://golang.org/pkg/net/http/)
 
 ## 🚀 Features
 
@@ -30,18 +34,6 @@ A robust, feature-rich HTTP/HTTPS web server built with Go, designed for product
 - Go 1.19 or higher
 - Optional: SSL certificate files for HTTPS
 
-### Quick Start
-```bash
-# Clone the repository
-git clone <repository-url>
-cd go-web-server
-
-# Build the server
-go build -o webserver web_server.go
-
-# Run with default settings
-./webserver
-```
 
 
 ## 🔧 Configuration
@@ -60,21 +52,6 @@ go build -o webserver web_server.go
 | `STATIC_DIR` | ./static | Static files directory |
 | `TEMPLATE_DIR` | ./templates | Templates directory |
 | `LOG_FILE` | | Log file path (stdout if empty) |
-
-### Basic Usage
-```bash
-# Start server on port 8080
-./webserver
-
-# Start with custom port
-PORT=3000 ./webserver
-
-# Enable HTTPS
-ENABLE_TLS=true CERT_FILE=cert.pem KEY_FILE=key.pem ./webserver
-
-# Custom configuration
-PORT=8443 ENABLE_TLS=true RATE_LIMIT=50 ./webserver
-```
 
 ## 🌐 Available Routes
 
