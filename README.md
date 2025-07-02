@@ -2,7 +2,7 @@
 
 A robust, feature-rich HTTP/HTTPS web server built with Go, designed for production use with advanced middleware, security features, and comprehensive monitoring capabilities.
 
-![Go](https://img.shields.io/badge/Go-1.19%2B-00ADD8.svg?logo=go)]
+![Go](https://img.shields.io/badge/Go-1.19%2B-00ADD8.svg?logo=go)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![HTTP](https://img.shields.io/badge/HTTP-Server-blue.svg)](https://golang.org/pkg/net/http/)
 
