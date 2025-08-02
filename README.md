@@ -3,7 +3,6 @@
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go)](https://golang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 [![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen?style=for-the-badge)](https://github.com/Kathitjoshi/GopherServe)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker)](https://www.docker.com/)
 [![Security](https://img.shields.io/badge/Security-Headers-orange?style=for-the-badge&logo=security)](https://securityheaders.com/)
 
 > A robust, concurrent, and feature-rich web server built with Go, designed for production environments with enterprise-grade features.
