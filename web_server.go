@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug" // Added for debug.Stack()
 	"strconv"
 	"strings"
 	"sync"
@@ -22,124 +23,150 @@ import (
 	"time"
 )
 
-// Server configuration
+//-----------------------------------------------------------------------------
+// Configuration & Data Structures
+//-----------------------------------------------------------------------------
+
+// Config holds all configurable parameters for the web server.
+// Values can be set via environment variables for cloud-native deployment.
 type Config struct {
-	Port            string
-	Host            string
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	IdleTimeout     time.Duration
-	MaxHeaderBytes  int
-	EnableTLS       bool
-	CertFile        string
-	KeyFile         string
-	EnableRateLimit bool
-	RateLimit       int
-	StaticDir       string
-	TemplateDir     string
-	LogFile         string
-	EnableMetrics   bool
-	EnableCORS      bool
-	TrustedProxies  []string
+	Port           string        // Port for the server to listen on (default: "8080")
+	Host           string        // Host interface to bind to (e.g., "0.0.0.0" for all, "localhost")
+	ReadTimeout    time.Duration // Maximum duration for reading the entire request
+	WriteTimeout   time.Duration // Maximum duration before timing out writes of the response
+	IdleTimeout    time.Duration // Maximum amount of time to wait for the next request when keep-alives are enabled
+	MaxHeaderBytes int           // Maximum size of request headers
+	EnableTLS      bool          // Flag to enable HTTPS/TLS
+	CertFile       string        // Path to TLS certificate file (e.g., server.crt)
+	KeyFile        string        // Path to TLS private key file (e.g., server.key)
+
+	EnableRateLimit bool // Flag to enable per-IP request rate limiting
+	RateLimit       int  // Max requests per minute per IP if rate limiting is enabled
+
+	StaticDir   string // Directory for serving static files (CSS, JS, images)
+	TemplateDir string // Directory containing HTML templates
+
+	LogFile        string   // Path to a file for server logs (empty for stdout only)
+	EnableMetrics  bool     // Flag to enable the /metrics endpoint and internal metrics collection
+	EnableCORS     bool     // Flag to enable Cross-Origin Resource Sharing (CORS) headers
+	TrustedProxies []string // List of trusted proxy IPs for correct client IP detection
 }
 
-// Server represents our enhanced web server
+// Server represents the main web server application instance.
 type Server struct {
 	config      *Config
 	templates   *template.Template
 	logger      *log.Logger
 	rateLimiter *RateLimiter
 	metrics     *Metrics
-	mu          sync.RWMutex
-	startTime   time.Time
+	mu          sync.RWMutex // Mutex for server-level state (though rarely needed for this design)
+	startTime   time.Time    // Time when the server started
 }
 
-// Metrics tracks server statistics
+// Metrics tracks various server statistics and performance indicators.
 type Metrics struct {
-	RequestCount  int64                    `json:"request_count"`
-	ErrorCount    int64                    `json:"error_count"`
-	StartTime     time.Time                `json:"start_time"`
-	Uptime        string                   `json:"uptime"`
-	EndpointStats map[string]*EndpointStat `json:"endpoint_stats"`
-	ResponseTimes []time.Duration          `json:"-"`
-	ActiveUsers   int64                    `json:"active_users"`
-	MemoryUsage   uint64                   `json:"memory_usage"`
-	CPUUsage      float64                  `json:"cpu_usage"`
-	mu            sync.RWMutex
+	RequestCount        int64                    `json:"request_count"`         // Total number of requests served
+	ErrorCount          int64                    `json:"error_count"`           // Total number of errors encountered
+	StartTime           time.Time                `json:"start_time"`            // Server start time
+	Uptime              string                   `json:"uptime"`                // Formatted server uptime
+	EndpointStats       map[string]*EndpointStat `json:"endpoint_stats"`        // Statistics per API endpoint
+	ResponseTimes       []time.Duration          `json:"-"`                     // Recent response times (not marshaled to JSON)
+	ActiveUsers         int64                    `json:"active_users"`          // Placeholder for tracking active users (requires more logic)
+	MemoryUsage         uint64                   `json:"memory_usage"`          // Current memory allocated by the Go process
+	CPUUsage            float64                  `json:"cpu_usage"`             // Placeholder for CPU usage (requires more advanced monitoring)
+	AverageResponseTime string                   `json:"average_response_time"` // Calculated average response time for JSON output
+	mu                  sync.RWMutex             // Mutex to protect concurrent access to metrics
 }
 
-// EndpointStat tracks individual endpoint statistics
+// EndpointStat tracks statistics for a specific API endpoint.
 type EndpointStat struct {
-	Count       int64         `json:"count"`
-	TotalTime   time.Duration `json:"total_time"`
-	AverageTime time.Duration `json:"average_time"`
-	LastAccess  time.Time     `json:"last_access"`
-	ErrorCount  int64         `json:"error_count"`
-	StatusCodes map[int]int64 `json:"status_codes"`
+	Count       int64         `json:"count"`        // Number of times this endpoint was accessed
+	TotalTime   time.Duration `json:"total_time"`   // Sum of all request durations for this endpoint
+	AverageTime time.Duration `json:"average_time"` // Average request duration for this endpoint
+	LastAccess  time.Time     `json:"last_access"`  // Last time this endpoint was accessed
+	ErrorCount  int64         `json:"error_count"`  // Number of errors for this endpoint
+	StatusCodes map[int]int64 `json:"status_codes"` // Count of each HTTP status code returned
 }
 
-// RateLimiter implements token bucket rate limiting
+// RateLimiter implements a token bucket algorithm for rate limiting client requests.
 type RateLimiter struct {
-	clients map[string]*ClientBucket
-	mu      sync.RWMutex
-	rate    int
+	clients map[string]*ClientBucket // Map of client IP to their token bucket
+	mu      sync.RWMutex             // Mutex for accessing the clients map
+	rate    int                      // Max tokens (requests) per minute
 }
 
-// ClientBucket represents a token bucket for a client
+// ClientBucket represents a single client's token bucket for rate limiting.
 type ClientBucket struct {
-	tokens     int
-	lastRefill time.Time
-	mu         sync.Mutex
+	tokens     int        // Current number of available tokens
+	lastRefill time.Time  // Last time the bucket was refilled
+	mu         sync.Mutex // Mutex to protect this specific bucket
 }
 
-// APIResponse represents a JSON API response
+// APIResponse is a standardized structure for JSON API responses.
 type APIResponse struct {
-	Success   bool        `json:"success"`
-	Data      interface{} `json:"data,omitempty"`
-	Error     string      `json:"error,omitempty"`
-	Meta      interface{} `json:"meta,omitempty"`
-	Timestamp time.Time   `json:"timestamp"`
-	Version   string      `json:"version"`
+	Success   bool        `json:"success"`         // Indicates if the request was successful
+	Data      interface{} `json:"data,omitempty"`  // Payload data on success
+	Error     string      `json:"error,omitempty"` // Error message on failure
+	Meta      interface{} `json:"meta,omitempty"`  // Optional metadata
+	Timestamp time.Time   `json:"timestamp"`       // Server timestamp of the response
+	Version   string      `json:"version"`         // API version
 }
 
-// TemplateData holds data for HTML templates
+// TemplateData holds dynamic data passed to HTML templates for rendering.
 type TemplateData struct {
-	Title      string
-	Subtitle   string
-	Message    string
-	Content    string
-	Data       map[string]interface{}
-	ServerTime string
-	GoVersion  string
-	ServerInfo map[string]interface{}
-	Metrics    *Metrics
-	Error      string
+	Title      string                 // Main title for the page
+	Subtitle   string                 // Subtitle/description
+	Message    string                 // A general message to display
+	Content    string                 // Main content text/HTML
+	Data       map[string]interface{} // Generic data map for displaying key-value pairs
+	ServerTime string                 // Formatted current server time
+	GoVersion  string                 // Go runtime version
+	ServerInfo map[string]interface{} // Server specific information
+	Metrics    *Metrics               // Full metrics object for metrics page
+	Error      string                 // Error message to display on the page
 }
 
-// NewConfig creates a new server configuration with defaults
+// responseWriter is a wrapper around http.ResponseWriter to capture the HTTP status code.
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int // Stores the status code written by the handler
+}
+
+// WriteHeader captures the status code before calling the underlying WriteHeader.
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+//-----------------------------------------------------------------------------
+// Configuration Initialization & Helpers
+//-----------------------------------------------------------------------------
+
+// NewConfig creates a new server configuration with default values,
+// allowing overrides via environment variables.
 func NewConfig() *Config {
 	return &Config{
 		Port:            getEnv("PORT", "8080"),
-		Host:            getEnv("HOST", "localhost"),
+		Host:            getEnv("HOST", "0.0.0.0"), // Default to 0.0.0.0 to bind to all interfaces
 		ReadTimeout:     30 * time.Second,
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
 		MaxHeaderBytes:  1 << 20, // 1 MB
-		EnableTLS:       getEnv("ENABLE_TLS", "false") == "true",
+		EnableTLS:       getEnvBool("ENABLE_TLS", false),
 		CertFile:        getEnv("CERT_FILE", "server.crt"),
 		KeyFile:         getEnv("KEY_FILE", "server.key"),
-		EnableRateLimit: getEnv("ENABLE_RATE_LIMIT", "true") == "true",
-		RateLimit:       getEnvInt("RATE_LIMIT", 100),
+		EnableRateLimit: getEnvBool("ENABLE_RATE_LIMIT", true), // Sensible default
+		RateLimit:       getEnvInt("RATE_LIMIT", 100),          // 100 requests per minute
 		StaticDir:       getEnv("STATIC_DIR", "./static"),
 		TemplateDir:     getEnv("TEMPLATE_DIR", "./templates"),
-		LogFile:         getEnv("LOG_FILE", ""),
-		EnableMetrics:   getEnv("ENABLE_METRICS", "true") == "true",
-		EnableCORS:      getEnv("ENABLE_CORS", "true") == "true",
+		LogFile:         getEnv("LOG_FILE", ""), // Empty string means log to stdout only
+		EnableMetrics:   getEnvBool("ENABLE_METRICS", true),
+		EnableCORS:      getEnvBool("ENABLE_CORS", true),
 		TrustedProxies:  strings.Split(getEnv("TRUSTED_PROXIES", "127.0.0.1,::1"), ","),
 	}
 }
 
-// Helper functions
+// getEnv retrieves an environment variable, returning a defaultValue if not found.
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -147,6 +174,7 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// getEnvInt retrieves an environment variable as an integer, returning a defaultValue if not found or invalid.
 func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
@@ -156,10 +184,18 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
-// =================================================================
-// >> FIX 1: Create a standalone helper function for formatting bytes
-// =================================================================
-func formatBytesHelper(bytes uint64) string {
+// getEnvBool retrieves an environment variable as a boolean, returning a defaultValue if not found or invalid.
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
+		}
+	}
+	return defaultValue
+}
+
+// formatBytes formats a byte count into a human-readable string (e.g., "1.2 MB").
+func formatBytes(bytes uint64) string {
 	const unit = 1024
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
@@ -172,88 +208,103 @@ func formatBytesHelper(bytes uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// NewRateLimiter creates a new rate limiter
+//-----------------------------------------------------------------------------
+// Rate Limiter Implementation
+//-----------------------------------------------------------------------------
+
+// NewRateLimiter creates and initializes a new RateLimiter instance.
 func NewRateLimiter(rate int) *RateLimiter {
 	return &RateLimiter{
 		clients: make(map[string]*ClientBucket),
-		rate:    rate,
+		rate:    rate, // Rate in requests per minute
 	}
 }
 
-// Allow checks if a client is allowed to make a request
+// Allow checks if a client's request is allowed based on the token bucket algorithm.
+// It refills tokens periodically and consumes one token per allowed request.
 func (rl *RateLimiter) Allow(clientIP string) bool {
 	rl.mu.RLock()
 	bucket, exists := rl.clients[clientIP]
 	rl.mu.RUnlock()
 
 	if !exists {
+		// If bucket doesn't exist, create it. Double-check after acquiring write lock.
 		rl.mu.Lock()
-		// Double check after acquiring write lock
+		defer rl.mu.Unlock() // Ensure unlock if creating a new bucket
 		if _, exists = rl.clients[clientIP]; !exists {
 			bucket = &ClientBucket{
-				tokens:     rl.rate,
+				tokens:     rl.rate, // Initialize with full tokens
 				lastRefill: time.Now(),
 			}
 			rl.clients[clientIP] = bucket
 		}
-		rl.mu.Unlock()
 	}
 
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
-	// Refill tokens based on time passed
+	// Refill tokens: The rate is per minute, so calculate tokens per second and refill based on elapsed time.
+	// For simplicity, we assume refill happens instantly per second.
 	now := time.Now()
-	elapsed := now.Sub(bucket.lastRefill)
-	tokensToAdd := int(elapsed.Seconds()) * rl.rate / 60 // Add tokens per second
+	elapsedSeconds := now.Sub(bucket.lastRefill).Seconds()
+	// Tokens to add: (rate per minute / 60 seconds) * elapsed seconds
+	tokensToAdd := int(elapsedSeconds * float64(rl.rate) / 60.0)
 
 	if tokensToAdd > 0 {
 		bucket.tokens += tokensToAdd
-		if bucket.tokens > rl.rate {
+		if bucket.tokens > rl.rate { // Cap tokens at max rate
 			bucket.tokens = rl.rate
 		}
-		bucket.lastRefill = now
+		bucket.lastRefill = now // Update last refill time
 	}
 
+	// Consume a token if available
 	if bucket.tokens > 0 {
 		bucket.tokens--
 		return true
 	}
 
-	return false
+	return false // No tokens left, request is denied
 }
 
-// NewMetrics creates a new metrics tracker
+//-----------------------------------------------------------------------------
+// Metrics Implementation
+//-----------------------------------------------------------------------------
+
+// NewMetrics creates and initializes a new Metrics tracker.
+// It also starts a background goroutine to periodically update system metrics.
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		StartTime:     time.Now(),
 		EndpointStats: make(map[string]*EndpointStat),
-		ResponseTimes: make([]time.Duration, 0, 1000),
+		ResponseTimes: make([]time.Duration, 0, 1000), // Pre-allocate capacity for efficiency
 	}
 	// Start a background goroutine to periodically update system metrics
 	go func() {
 		for {
 			m.updateSystemMetrics()
-			time.Sleep(5 * time.Second)
+			time.Sleep(5 * time.Second) // Update every 5 seconds
 		}
 	}()
 	return m
 }
 
-// RecordRequest records a request in metrics
+// RecordRequest updates metrics for a single incoming HTTP request.
 func (m *Metrics) RecordRequest(endpoint string, duration time.Duration, statusCode int) {
-	m.mu.Lock()
+	m.mu.Lock() // Acquire write lock for all metrics updates
 	defer m.mu.Unlock()
 
 	m.RequestCount++
+	// Uptime is calculated on demand for display, but can be updated here too
 	m.Uptime = time.Since(m.StartTime).Truncate(time.Second).String()
 
-	// Add response time (keep only last 1000)
+	// Add response time to a circular buffer of last 1000 response times
 	m.ResponseTimes = append(m.ResponseTimes, duration)
 	if len(m.ResponseTimes) > 1000 {
-		m.ResponseTimes = m.ResponseTimes[1:]
+		m.ResponseTimes = m.ResponseTimes[1:] // Drop the oldest entry
 	}
 
+	// Update endpoint-specific statistics
 	stat, exists := m.EndpointStats[endpoint]
 	if !exists {
 		stat = &EndpointStat{
@@ -264,29 +315,41 @@ func (m *Metrics) RecordRequest(endpoint string, duration time.Duration, statusC
 
 	stat.Count++
 	stat.TotalTime += duration
-	stat.AverageTime = stat.TotalTime / time.Duration(stat.Count)
+	// Calculate average time; handle division by zero for first request
+	if stat.Count > 0 {
+		stat.AverageTime = stat.TotalTime / time.Duration(stat.Count)
+	}
 	stat.LastAccess = time.Now()
 	stat.StatusCodes[statusCode]++
 
+	// Increment error count for status codes 400 or higher
 	if statusCode >= 400 {
 		stat.ErrorCount++
 		m.ErrorCount++
 	}
 }
 
-// updateSystemMetrics updates system resource metrics
+// updateSystemMetrics gathers runtime memory statistics.
+// CPU usage requires more complex OS-specific calls or libraries.
 func (m *Metrics) updateSystemMetrics() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
-	m.MemoryUsage = memStats.Alloc
+	m.MemoryUsage = memStats.Alloc // Bytes allocated and still in use
+
+	// Update uptime here as well, although it's also done in RecordRequest
 	m.Uptime = time.Since(m.StartTime).Truncate(time.Second).String()
+
+	// CPUUsage is currently not implemented due to platform-specific complexities.
+	// For production, consider using external libraries like "github.com/shirou/gopsutil".
+	m.CPUUsage = 0.0 // Placeholder
 }
 
-// GetAverageResponseTime calculates average response time
+// GetAverageResponseTime calculates the average response time from the collected samples.
 func (m *Metrics) GetAverageResponseTime() time.Duration {
-	m.mu.RLock()
+	m.mu.RLock() // Acquire read lock
 	defer m.mu.RUnlock()
 
 	if len(m.ResponseTimes) == 0 {
@@ -300,7 +363,12 @@ func (m *Metrics) GetAverageResponseTime() time.Duration {
 	return total / time.Duration(len(m.ResponseTimes))
 }
 
-// NewServer creates a new enhanced server instance
+//-----------------------------------------------------------------------------
+// Server Initialization
+//-----------------------------------------------------------------------------
+
+// NewServer creates and initializes a new Server instance.
+// It sets up logging, rate limiting, and loads HTML templates.
 func NewServer(config *Config) (*Server, error) {
 	server := &Server{
 		config:    config,
@@ -308,75 +376,68 @@ func NewServer(config *Config) (*Server, error) {
 		startTime: time.Now(),
 	}
 
-	// Setup logger
+	// 1. Setup Logger: Determines where logs are written (stdout or file).
 	var logOutput io.Writer = os.Stdout
 	if config.LogFile != "" {
 		logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open log file: %v", err)
+			return nil, fmt.Errorf("failed to open log file %q: %w", config.LogFile, err)
 		}
+		// Use a multi-writer to output to both console and file
 		logOutput = io.MultiWriter(os.Stdout, logFile)
 	}
+	// Configure the logger with a prefix and standard flags (date, time, file:line)
 	server.logger = log.New(logOutput, "[SERVER] ", log.LstdFlags|log.Lshortfile)
 
-	// Setup rate limiter
+	// 2. Setup Rate Limiter: Only if enabled in configuration.
 	if config.EnableRateLimit {
 		server.rateLimiter = NewRateLimiter(config.RateLimit)
+		server.logger.Printf("Rate limiting enabled: %d requests/minute per IP", config.RateLimit)
+	} else {
+		server.logger.Println("Rate limiting disabled.")
 	}
 
-	// Load templates
+	// 3. Load Templates: Parse HTML templates from the specified directory.
 	if err := server.loadTemplates(); err != nil {
-		return nil, fmt.Errorf("failed to load templates: %v", err)
+		return nil, fmt.Errorf("failed to load templates: %w", err)
 	}
 
-	// Create static directory if it doesn't exist
+	// 4. Create Static Directory: Ensure the static assets directory exists.
 	if err := os.MkdirAll(config.StaticDir, 0755); err != nil {
-		server.logger.Printf("Warning: failed to create static directory: %v", err)
+		server.logger.Printf("Warning: failed to create static directory %q: %v", config.StaticDir, err)
 	}
 
-	server.logger.Printf("✅ Server initialized successfully")
+	server.logger.Println("✅ Server initialized successfully.")
 	return server, nil
 }
 
-// loadTemplates loads HTML templates with enhanced error handling
+// loadTemplates loads HTML templates from the configured directory.
+// It also creates a default template if none exists and adds custom functions.
 func (s *Server) loadTemplates() error {
-	// Create template directory if it doesn't exist
+	// Ensure the template directory exists
 	if err := os.MkdirAll(s.config.TemplateDir, 0755); err != nil {
-		return err
+		return fmt.Errorf("failed to create template directory %q: %w", s.config.TemplateDir, err)
 	}
 
-	// Create default template if none exist
+	// Check for a default template; create if missing
 	defaultTemplatePath := filepath.Join(s.config.TemplateDir, "default.html")
 	if _, err := os.Stat(defaultTemplatePath); os.IsNotExist(err) {
-		s.logger.Printf("Default template not found. Creating one at %s", defaultTemplatePath)
+		s.logger.Printf("Default template %q not found. Creating one...", defaultTemplatePath)
 		if err := s.createDefaultTemplate(defaultTemplatePath); err != nil {
-			return err
+			return fmt.Errorf("failed to create default template: %w", err)
 		}
 	}
 
-	// Parse templates with enhanced functions
+	// Initialize template parser with custom functions
 	tmpl := template.New("").Funcs(template.FuncMap{
-		"title": strings.ToTitle,
-		"upper": strings.ToUpper,
-		"lower": strings.ToLower,
-		"formatTime": func(t time.Time) string {
-			return t.Format("2006-01-02 15:04:05")
-		},
-		"formatDuration": func(d time.Duration) string {
-			if d < time.Minute {
-				return fmt.Sprintf("%.1fs", d.Seconds())
-			}
-			if d < time.Hour {
-				return fmt.Sprintf("%.1fm", d.Minutes())
-			}
-			return fmt.Sprintf("%.1fh", d.Hours())
-		},
-		// =================================================================
-		// >> FIX 2: Use the named helper function in the FuncMap
-		// =================================================================
-		"formatBytes": formatBytesHelper,
-		"add":         func(a, b int) int { return a + b },
-		"formatNumber": func(n int64) string {
+		"title":          strings.ToTitle,
+		"upper":          strings.ToUpper,
+		"lower":          strings.ToLower,
+		"formatTime":     func(t time.Time) string { return t.Format("2006-01-02 15:04:05 MST (UTC)") }, // Add MST for timezone
+		"formatDuration": func(d time.Duration) string { return d.Round(time.Millisecond).String() },    // Use .String() with rounding
+		"formatBytes":    formatBytes,                                                                   // Use the standalone helper function
+		"add":            func(a, b int) int { return a + b },
+		"formatNumber": func(n int64) string { // Format large numbers (e.g., 1234567 -> 1.2M)
 			if n < 1000 {
 				return fmt.Sprintf("%d", n)
 			}
@@ -387,20 +448,20 @@ func (s *Server) loadTemplates() error {
 		},
 	})
 
+	// Parse all .html files in the template directory
 	var err error
 	s.templates, err = tmpl.ParseGlob(filepath.Join(s.config.TemplateDir, "*.html"))
 	if err != nil {
-		s.logger.Printf("Template parsing error: %v", err)
-		return err
+		return fmt.Errorf("failed to parse templates from %q: %w", s.config.TemplateDir, err)
 	}
 
-	s.logger.Printf("✅ Templates loaded successfully from: %s", s.config.TemplateDir)
+	s.logger.Printf("✅ Templates loaded successfully from: %s (%d files)", s.config.TemplateDir, len(s.templates.Templates()))
 	return nil
 }
 
-// createDefaultTemplate creates a comprehensive default HTML template
+// createDefaultTemplate writes a comprehensive default HTML template to the specified filename.
+// This is useful if no templates exist initially, providing a basic functional UI.
 func (s *Server) createDefaultTemplate(filename string) error {
-	// (This function's content is correct and remains unchanged)
 	content := `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -502,7 +563,7 @@ func (s *Server) createDefaultTemplate(filename string) error {
 			let serverTime = new Date('{{.ServerTime}}');
 			setInterval(() => {
 				serverTime.setSeconds(serverTime.getSeconds() + 1);
-				timeEl.textContent = serverTime.toISOString().slice(0, 19).replace('T', ' ');
+				timeEl.textContent = serverTime.toISOString().slice(0, 19).replace('T', ' ') + ' UTC'; // Add UTC back
 			}, 1000);
 		}
 	</script>
@@ -512,47 +573,43 @@ func (s *Server) createDefaultTemplate(filename string) error {
 	return os.WriteFile(filename, []byte(content), 0644)
 }
 
-// --- Middleware ---
+//-----------------------------------------------------------------------------
+// Middleware Functions
+//-----------------------------------------------------------------------------
 
+// loggingMiddleware logs details of incoming HTTP requests.
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		s.logger.Printf("%s %s %s %s", r.Method, r.RequestURI, time.Since(start), r.RemoteAddr)
+		next.ServeHTTP(w, r) // Call the next handler in the chain
+		s.logger.Printf("INFO: %s %s %s %s %s", r.Method, r.RequestURI, r.Proto, time.Since(start).Round(time.Millisecond), r.RemoteAddr)
 	})
 }
 
+// metricsMiddleware collects and records request-specific metrics.
 func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		// Use a response writer wrapper to capture status code
+		// Wrap the response writer to capture the HTTP status code
 		rw := &responseWriter{ResponseWriter: w}
 		next.ServeHTTP(rw, r)
 		duration := time.Since(start)
 
-		// Create a sanitized endpoint name
+		// Sanitize the URL path for consistent endpoint naming in metrics
+		// e.g., /users/123 becomes /users/:id
 		endpoint := r.Method + " " + regexp.MustCompile(`/\d+`).ReplaceAllString(r.URL.Path, "/:id")
 		s.metrics.RecordRequest(endpoint, duration, rw.statusCode)
 	})
 }
 
-// responseWriter is a wrapper to capture status code
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
+// rateLimitMiddleware applies rate limiting based on the client's IP address.
 func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.config.EnableRateLimit {
-			clientIP := s.getClientIP(r)
+			clientIP := s.getClientIP(r) // Get the true client IP, considering proxies
 			if !s.rateLimiter.Allow(clientIP) {
-				s.respondError(w, http.StatusTooManyRequests, "Too many requests")
+				s.logger.Printf("RATE_LIMIT: Client %q exceeded rate limit for %s %s", clientIP, r.Method, r.URL.Path)
+				s.respondError(w, http.StatusTooManyRequests, "Too many requests. Please try again later.")
 				return
 			}
 		}
@@ -560,13 +617,16 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// corsMiddleware sets appropriate CORS headers if enabled.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.config.EnableCORS {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Origin", "*") // For production, specify allowed origins
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+			w.Header().Set("Access-Control-Max-Age", "86400") // Cache preflight response for 24 hours
 		}
+		// Handle preflight requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -575,94 +635,132 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// securityHeadersMiddleware adds various security-related HTTP headers.
 func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("X-Content-Type-Options", "nosniff")                                                                                                                        // Prevents browser from MIME-sniffing a response away from the declared content-type
+		w.Header().Set("X-Frame-Options", "DENY")                                                                                                                                  // Prevents clickjacking by forbidding embedding in iframes
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;") // CSP for basic XSS protection
+		w.Header().Set("X-XSS-Protection", "1; mode=block")                                                                                                                        // Enables XSS filter in browsers
+		w.Header().Set("Referrer-Policy", "no-referrer-when-downgrade")                                                                                                            // Controls referrer information
 		next.ServeHTTP(w, r)
 	})
 }
 
+// recoverPanicMiddleware recovers from panics in HTTP handlers to prevent server crashes.
 func (s *Server) recoverPanicMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				s.logger.Printf("PANIC: %v", err)
-				s.respondError(w, http.StatusInternalServerError, "Internal Server Error")
+				s.logger.Printf("CRITICAL: PANIC Recovered: %v. Stack: %s", err, debug.Stack()) // Log stack trace
+				s.respondError(w, http.StatusInternalServerError, "Internal Server Error. Our team has been notified.")
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
 }
 
-// --- Handlers ---
+//-----------------------------------------------------------------------------
+// HTTP Handler Functions
+//-----------------------------------------------------------------------------
 
+// handleHome renders the main dashboard page with server uptime and request count.
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		s.handleNotFound(w, r) // Handle routes not specifically defined
+		return
+	}
+
 	data := TemplateData{
-		Title:    "Go Web Server",
-		Subtitle: "A modern, production-ready web server.",
+		Title:    "Go Web Server Dashboard",
+		Subtitle: "A concurrent, production-ready web server with metrics and security features.",
 		Data: map[string]interface{}{
-			"Uptime":          s.metrics.Uptime,
+			"Server Uptime":   s.metrics.Uptime,
 			"Requests Served": s.metrics.RequestCount,
-			// =================================================================
-			// >> FIX 3: Call the helper function directly from the handler
-			// =================================================================
-			"Memory Usage": formatBytesHelper(s.metrics.MemoryUsage),
-			"Go Routines":  runtime.NumGoroutine(),
+			"Errors Count":    s.metrics.ErrorCount,
+			"Memory Usage":    formatBytes(s.metrics.MemoryUsage),
+			"Go Routines":     runtime.NumGoroutine(),
 		},
 	}
 	s.renderTemplate(w, "default.html", data)
 }
 
+// handleAbout renders the about page with general server information.
 func (s *Server) handleAbout(w http.ResponseWriter, r *http.Request) {
 	data := TemplateData{
 		Title:   "About This Server",
-		Message: "Server Information",
-		Content: "This server is a demonstration of a robust, production-grade web service written in Go. It features a modern UI, middleware for logging, metrics, security, rate-limiting, and graceful shutdown capabilities.",
+		Message: "Server Information & Features",
+		Content: "This server is a demonstration of a robust, production-grade web service written in Go. It features a modern UI, middleware for logging, metrics, security, rate-limiting, and graceful shutdown capabilities. It's designed for high concurrency and resilience.",
+		Data: map[string]interface{}{
+			"Go Version":      runtime.Version(),
+			"OS / Arch":       fmt.Sprintf("%s / %s", runtime.GOOS, runtime.GOARCH),
+			"Max Procs (CPU)": runtime.GOMAXPROCS(0), // Number of OS threads Go can use
+		},
 	}
 	s.renderTemplate(w, "default.html", data)
 }
 
+// handleTime renders a page displaying current server time in various formats.
 func (s *Server) handleTime(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	data := TemplateData{
 		Title:   "Server Time",
 		Message: "The current server time is:",
 		Data: map[string]interface{}{
-			"Time (UTC)":   now.UTC().Format(time.RFC1123),
-			"Time (Local)": now.Format(time.RFC1123),
-			"Unix Time":    now.Unix(),
+			"UTC Time":       now.UTC().Format("2006-01-02 15:04:05 MST (UTC)"),
+			"Local Time":     now.Format("2006-01-02 15:04:05 MST (Local)"),
+			"Unix Timestamp": now.Unix(),
+			"RFC1123":        now.Format(time.RFC1123),
 		},
 	}
 	s.renderTemplate(w, "default.html", data)
 }
 
+// handleDay renders a page displaying current date-related information.
 func (s *Server) handleDay(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	data := TemplateData{
 		Title:   "Day Information",
 		Message: "Today's Date Information:",
 		Data: map[string]interface{}{
-			"Date":        now.Format("January 2, 2006"),
-			"Day of Week": now.Weekday().String(),
-			"Day of Year": now.YearDay(),
+			"Current Date": now.Format("Monday, January 2, 2006"),
+			"Day of Week":  now.Weekday().String(),
+			"Day of Year":  now.YearDay(),
+			"Week of Year": (now.YearDay() / 7) + 1, // Simple week calculation
+			"Month":        now.Month().String(),
 		},
 	}
 	s.renderTemplate(w, "default.html", data)
 }
 
+// handleHealth provides a simple JSON health check endpoint.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	s.respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	s.respondJSON(w, http.StatusOK, map[string]string{"status": "healthy", "message": "Server is operational"})
 }
 
+// handleMetrics provides a JSON endpoint with current server performance metrics.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	s.metrics.mu.RLock()
+	if !s.config.EnableMetrics {
+		s.respondError(w, http.StatusNotFound, "Metrics endpoint is disabled")
+		return
+	}
+	s.metrics.mu.RLock() // Acquire read lock before marshaling metrics
 	defer s.metrics.mu.RUnlock()
-	s.respondJSON(w, http.StatusOK, s.metrics)
+
+	// Update uptime just before sending to ensure it's fresh
+	s.metrics.Uptime = time.Since(s.metrics.StartTime).Truncate(time.Second).String()
+
+	// Create a copy of the metrics to work with (avoids modifying the live metrics under read lock)
+	metricsCopy := *s.metrics
+
+	// Calculate average response time and assign it to the new field in the copy
+	avgRTDuration := s.metrics.GetAverageResponseTime()
+	metricsCopy.AverageResponseTime = avgRTDuration.Round(time.Microsecond).String() // Format it nicely
+
+	s.respondJSON(w, http.StatusOK, metricsCopy)
 }
 
+// handleAPIStatus provides a simple JSON endpoint to confirm API functionality.
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	s.respondJSON(w, http.StatusOK, APIResponse{
 		Success: true,
@@ -670,84 +768,137 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- Helper Methods ---
+// handleNotFound serves a custom 404 page for unmatched routes.
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+	data := TemplateData{
+		Title:   "404 Not Found",
+		Message: "Page Not Found",
+		Error:   fmt.Sprintf("The requested URL %q was not found on this server.", r.URL.Path),
+	}
+	s.renderTemplate(w, "default.html", data) // Render the default template for 404
+}
 
+//-----------------------------------------------------------------------------
+// General HTTP Response Helpers
+//-----------------------------------------------------------------------------
+
+// renderTemplate executes the specified HTML template with the given data.
 func (s *Server) renderTemplate(w http.ResponseWriter, name string, data TemplateData) {
-	// Add common data to all templates
+	// Populate common data fields for all templates
 	data.GoVersion = strings.TrimPrefix(runtime.Version(), "go")
-	data.ServerTime = time.Now().UTC().Format("2006-01-02 15:04:05") + " UTC"
+	data.ServerTime = time.Now().UTC().Format("2006-01-02 15:04:05") + " UTC" // Standardize time format
 
+	// Look up the specific template by name
 	tmpl := s.templates.Lookup(name)
 	if tmpl == nil {
-		s.logger.Printf("Template %s not found", name)
-		s.respondError(w, http.StatusInternalServerError, "Template not found")
+		s.logger.Printf("ERROR: Template %q not found or not parsed.", name)
+		s.respondError(w, http.StatusInternalServerError, "Server error: Template not found.")
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	err := tmpl.Execute(w, data)
-	if err != nil {
-		s.logger.Printf("Error executing template %s: %v", name, err)
-		s.respondError(w, http.StatusInternalServerError, "Error rendering page")
+	if err := tmpl.Execute(w, data); err != nil {
+		s.logger.Printf("ERROR: Failed to execute template %q: %v", name, err)
+		s.respondError(w, http.StatusInternalServerError, "Server error: Failed to render page.")
 	}
 }
 
+// respondError sends a JSON error response to the client.
 func (s *Server) respondError(w http.ResponseWriter, code int, message string) {
 	s.respondJSON(w, code, APIResponse{Success: false, Error: message})
 }
 
+// respondJSON sends a JSON response to the client.
 func (s *Server) respondJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	// Add timestamp and version to APIResponse if applicable
+	// If the payload is an APIResponse, ensure timestamp and version are set.
 	if resp, ok := payload.(APIResponse); ok {
 		resp.Timestamp = time.Now().UTC()
-		resp.Version = "v1.0"
+		if resp.Version == "" {
+			resp.Version = "v1.0" // Default API version
+		}
 		payload = resp
+	} else if respErr, ok := payload.(struct {
+		Success bool
+		Error   string
+	}); ok && !respErr.Success {
+		// If it's an anonymous error struct (e.g., from respondError), wrap it in APIResponse
+		payload = APIResponse{
+			Success:   false,
+			Error:     respErr.Error,
+			Timestamp: time.Now().UTC(),
+			Version:   "v1.0",
+		}
 	}
 
-	response, err := json.Marshal(payload)
+	responseBytes, err := json.MarshalIndent(payload, "", "  ") // Use MarshalIndent for pretty-printing JSON
 	if err != nil {
-		s.logger.Printf("JSON marshaling error: %v", err)
+		s.logger.Printf("ERROR: JSON marshaling error: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"success":false,"error":"Internal Server Error"}`))
+		// Fallback error message if JSON marshaling fails
+		w.Write([]byte(`{"success":false,"error":"Internal Server Error - JSON encoding failed"}`))
 		return
 	}
 
 	w.WriteHeader(code)
-	w.Write(response)
+	w.Write(responseBytes)
 }
 
+// getClientIP extracts the true client IP address, handling X-Forwarded-For and X-Real-IP headers.
 func (s *Server) getClientIP(r *http.Request) string {
-	ip := r.Header.Get("X-Forwarded-For")
-	ip = strings.TrimSpace(strings.Split(ip, ",")[0])
-	if ip != "" {
-		return ip
+	// Check X-Forwarded-For header first (common in load balancers/proxies)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For can contain a comma-separated list of IPs.
+		// The first IP is usually the original client IP.
+		ips := strings.Split(xff, ",")
+		for _, ip := range ips {
+			trimmedIP := strings.TrimSpace(ip)
+			// Validate if the IP is from a trusted proxy if trusted_proxies is configured
+			if len(s.config.TrustedProxies) > 0 {
+				isTrusted := false
+				for _, trusted := range s.config.TrustedProxies {
+					if trimmedIP == trusted { // Simplified check, could use CIDR matching
+						isTrusted = true
+						break
+					}
+				}
+				if isTrusted {
+					continue // Skip trusted proxy IPs, look for the actual client behind it
+				}
+			}
+			return trimmedIP // Return the first non-trusted IP
+		}
 	}
 
-	ip = r.Header.Get("X-Real-IP")
-	if ip != "" {
-		return ip
+	// Check X-Real-IP header (another common proxy header)
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
 	}
 
+	// Fallback to r.RemoteAddr if no proxy headers are found
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {
 		return ip
 	}
-	return r.RemoteAddr
+	return r.RemoteAddr // Return raw RemoteAddr if parsing fails
 }
 
-// --- Server Lifecycle ---
+//-----------------------------------------------------------------------------
+// Server Lifecycle Management
+//-----------------------------------------------------------------------------
 
+// Run starts the HTTP server, sets up graceful shutdown, and handles TLS if enabled.
 func (s *Server) Run() error {
-	// Setup router and middleware chain
+	// Create a new ServeMux for routing HTTP requests
 	mux := http.NewServeMux()
 
-	// Static file server
+	// 1. Static File Server: Serve files from the configured static directory.
 	staticFS := http.FileServer(http.Dir(s.config.StaticDir))
 	mux.Handle("/static/", http.StripPrefix("/static/", staticFS))
 
-	// Register handlers
+	// 2. Register HTTP Handlers for specific routes.
 	mux.HandleFunc("/", s.handleHome)
 	mux.HandleFunc("/about", s.handleAbout)
 	mux.HandleFunc("/time", s.handleTime)
@@ -755,17 +906,27 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
+	// Add a catch-all for unmatched routes (404)
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(s.config.StaticDir, "favicon.ico"))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(s.config.StaticDir, "robots.txt"))
+	})
+	// Generic handler for anything not matched by specific routes
+	mux.HandleFunc("/_/*", s.handleNotFound) // Catch-all for other sub-paths not defined
 
-	// Chain middleware
+	// 3. Chain Middleware: Apply middleware in the desired order (outermost to innermost).
+	// Recovery from panics should be the outermost to catch errors from all subsequent middleware/handlers.
 	var handler http.Handler = mux
-	handler = s.recoverPanicMiddleware(handler)
-	handler = s.loggingMiddleware(handler)
-	handler = s.metricsMiddleware(handler)
-	handler = s.rateLimitMiddleware(handler)
-	handler = s.corsMiddleware(handler)
-	handler = s.securityHeadersMiddleware(handler)
+	handler = s.recoverPanicMiddleware(handler)    // Catches panics
+	handler = s.loggingMiddleware(handler)         // Logs requests
+	handler = s.metricsMiddleware(handler)         // Collects metrics
+	handler = s.rateLimitMiddleware(handler)       // Applies rate limiting
+	handler = s.corsMiddleware(handler)            // Adds CORS headers
+	handler = s.securityHeadersMiddleware(handler) // Adds security headers
 
-	// Configure the HTTP server
+	// 4. Configure the standard Go HTTP server instance.
 	httpServer := &http.Server{
 		Addr:           net.JoinHostPort(s.config.Host, s.config.Port),
 		Handler:        handler,
@@ -775,33 +936,30 @@ func (s *Server) Run() error {
 		MaxHeaderBytes: s.config.MaxHeaderBytes,
 	}
 
-	// Graceful shutdown setup
+	// 5. Setup Graceful Shutdown: Listen for OS signals to gracefully stop the server.
 	shutdownChan := make(chan os.Signal, 1)
-	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM) // Listen for Ctrl+C and termination signals
 
+	// Channel to receive errors from the HTTP server's ListenAndServe call.
 	serverErrors := make(chan error, 1)
 
-	// Start the server in a goroutine
-	// Inside the Run() method...
-
+	// Start the HTTP server in a non-blocking goroutine.
 	go func() {
-		// >> NEW: Logic to create a user-friendly, clickable URL
+		// Log the URL for easy access. If listening on 0.0.0.0, provide localhost link.
 		scheme := "http"
 		if s.config.EnableTLS {
 			scheme = "https"
 		}
-		// If listening on all interfaces, use 'localhost' for the clickable link.
 		displayHost := s.config.Host
 		if displayHost == "0.0.0.0" || displayHost == "::" {
-			displayHost = "localhost"
+			displayHost = "localhost" // For local clickable link
 		}
-		url := fmt.Sprintf("%s://%s:%s", scheme, displayHost, s.config.Port)
+		serverURL := fmt.Sprintf("%s://%s:%s", scheme, displayHost, s.config.Port)
 
-		addr := httpServer.Addr
-		s.logger.Printf("🚀 Server starting on %s (TLS: %v)", addr, s.config.EnableTLS)
-		// >> NEW: The log line with the clickable link
-		s.logger.Printf("✅ Server is listening. Access it at: %s", url)
+		s.logger.Printf("🚀 Server starting on %s (TLS: %t, Rate Limit: %t)", httpServer.Addr, s.config.EnableTLS, s.config.EnableRateLimit)
+		s.logger.Printf("✅ Server is listening. Access it at: %s", serverURL)
 
+		// Start listening for incoming requests.
 		if s.config.EnableTLS {
 			serverErrors <- httpServer.ListenAndServeTLS(s.config.CertFile, s.config.KeyFile)
 		} else {
@@ -809,33 +967,55 @@ func (s *Server) Run() error {
 		}
 	}()
 
-	// Block until a signal is received or an error occurs
+	// Block main goroutine until a shutdown signal is received or server encounters an error.
 	select {
 	case err := <-serverErrors:
-		return fmt.Errorf("server error: %w", err)
+		// An error occurred during server startup/operation (e.g., port in use)
+		return fmt.Errorf("server startup/runtime error: %w", err)
 	case sig := <-shutdownChan:
-		s.logger.Printf("Received signal: %v. Starting graceful shutdown...", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// Received an OS signal (SIGINT/SIGTERM) for graceful shutdown
+		s.logger.Printf("Received OS signal: %v. Initiating graceful shutdown...", sig)
+		// Create a context with a timeout for graceful shutdown.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 15 seconds to shut down
 		defer cancel()
 
+		// Attempt to gracefully shut down the server.
 		if err := httpServer.Shutdown(ctx); err != nil {
+			// Force close the server if graceful shutdown fails
+			s.logger.Printf("ERROR: Force closing server due to graceful shutdown failure: %v", err)
 			httpServer.Close()
-			return fmt.Errorf("could not stop server gracefully: %w", err)
+			return fmt.Errorf("server failed graceful shutdown: %w", err)
 		}
 		s.logger.Println("✅ Server stopped gracefully.")
 	}
 
-	return nil
+	return nil // Server exited cleanly
 }
 
+//-----------------------------------------------------------------------------
+// Main Entry Point
+//-----------------------------------------------------------------------------
+
 func main() {
+	// Initialize logging for the main function before server setup
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lshortfile) // Keep standard flags for main func fatal errors
+
+	// Load server configuration
 	config := NewConfig()
+
+	// Create a new server instance
 	server, err := NewServer(config)
 	if err != nil {
-		log.Fatalf("❌ Failed to initialize server: %v", err)
+		log.Fatalf("❌ FATAL: Failed to initialize server: %v", err)
 	}
 
+	// Run the server. The Run method blocks until shutdown.
 	if err := server.Run(); err != nil && err != http.ErrServerClosed {
-		server.logger.Fatalf("❌ Server failed to run: %v", err)
+		// Log fatal error if server fails to run for reasons other than graceful shutdown
+		server.logger.Fatalf("❌ FATAL: Server failed to run: %v", err)
 	}
+
+	// Program exits after server stops
+	log.Println("👋 Server application exited.")
 }
