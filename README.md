@@ -68,14 +68,8 @@ docker run -p 8080:8080 GopherServe
 ```
 .
 ├── web_server.go           # Main server implementation
-├── templates/              # HTML templates
-│   └── default.html       # Auto-generated default template
-├── static/                 # Static assets (CSS, JS, images)
-│   ├── favicon.ico
-│   └── robots.txt
 ├── README.md              # This file
-├── Dockerfile             # Docker configuration
-└── docker-compose.yml     # Docker Compose setup
+
 ```
 
 ## ⚙️ Configuration
