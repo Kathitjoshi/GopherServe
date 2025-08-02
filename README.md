@@ -53,15 +53,7 @@ go run web_server.go
 
 The server will start on `http://localhost:8080` by default.
 
-### Using Docker
 
-```bash
-# Build the Docker image
-docker build -t GopherServe .
-
-# Run the container
-docker run -p 8080:8080 GopherServe
-```
 
 ## 📁 Project Structure
 
