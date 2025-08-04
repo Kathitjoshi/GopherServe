@@ -149,41 +149,7 @@ The server provides comprehensive metrics via the `/metrics` endpoint:
 }
 ```
 
-## 🐳 Docker Support
 
-### Dockerfile
-```dockerfile
-FROM golang:1.21-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN go build -o server web_server.go
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /app/server .
-COPY --from=builder /app/templates ./templates
-COPY --from=builder /app/static ./static
-EXPOSE 8080
-CMD ["./server"]
-```
-
-### Docker Compose
-```yaml
-version: '3.8'
-services:
-  web-server:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - ENABLE_RATE_LIMIT=true
-      - RATE_LIMIT=100
-      - ENABLE_METRICS=true
-    volumes:
-      - ./logs:/var/log
-    restart: unless-stopped
-```
 
 ## 🔧 Development
 
@@ -235,20 +201,7 @@ curl http://localhost:8080/health
 curl http://localhost:8080/metrics
 ```
 
-For load balancers and orchestrators:
-```yaml
-# Kubernetes liveness probe
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 8080
-  initialDelaySeconds: 30
-  periodSeconds: 10
 
-# Docker health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8080/health || exit 1
-```
 
 ## 🔒 Security Features
 
